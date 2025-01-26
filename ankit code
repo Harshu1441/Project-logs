@@ -1,0 +1,139 @@
+
+import psutil
+from scapy.all import sniff, DNS, DNSQR
+from scapy.layers.inet import IP
+import subprocess
+import sys
+import json
+
+# Define the log file
+LOG_FILE = "dns_query_logs.json"
+
+def get_process_by_port(port):
+    """Find the process using a specific port."""
+    try:
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.laddr.port == port:
+                pid = conn.pid
+                if pid:
+                    process = psutil.Process(pid)
+                    return pid, process.name(), process.exe(), process
+    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        pass
+    return None, None, None, None
+
+
+def get_svchost_services(pid):
+    """Retrieve services associated with an svchost.exe process."""
+    try:
+        command = f'tasklist /SVC /FI "PID eq {pid}"'  # Windows command to list services
+        output = subprocess.check_output(command, shell=True, text=True)
+        lines = output.strip().split("\n")
+        services = []
+        for line in lines[3:]:  # Skip the header lines
+            parts = line.split()
+            if len(parts) > 1 and parts[0] == str(pid):
+                services.extend(parts[1:])
+        return services
+    except subprocess.SubprocessError:
+        return []
+
+
+def get_parent_process(process):
+    """Trace the parent process of a given process."""
+    try:
+        if process and process.name().lower() == "svchost.exe":
+            parent = process.parent()
+            if parent:
+                return parent.pid, parent.name(), parent.exe()
+    except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
+        pass
+    return None, None, None
+
+
+def get_application_from_pid(pid):
+    """Retrieve the application that owns the given process ID."""
+    try:
+        process = psutil.Process(pid)
+        return process.name(), process.exe()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None, None
+
+
+def dns_sniffer(packet):
+    """Sniff DNS queries and map them to processes."""
+    try:
+        if packet.haslayer(DNS) and packet.getlayer(DNS).qr == 0:  # DNS Query
+            dns_query = packet.getlayer(DNSQR).qname.decode('utf-8')
+            src_ip = packet[IP].src if packet.haslayer(IP) else None
+            src_port = packet[IP].sport if packet.haslayer(IP) else None
+
+            log_data = {
+                "dns_query": dns_query,
+                "src_ip": src_ip,
+                "src_port": src_port,
+                "process": {},
+                "parent_process": {}
+            }
+
+            pid, process_name, executable_path, process = get_process_by_port(src_port)
+            if pid:
+                log_data["process"] = {
+                    "pid": pid,
+                    "name": process_name,
+                    "executable_path": executable_path
+                }
+
+                # If the process is svchost.exe, retrieve associated services
+                if process_name.lower() == "svchost.exe":
+                    services = get_svchost_services(pid)
+                    if services:
+                        log_data["process"]["services"] = services
+                        if "Dnscache" in services:
+                            log_data["process"]["dns_cache_service"] = "Dnscache"
+                        else:
+                            log_data["process"]["dns_cache_service"] = "Not found"
+                    
+                    # Trace the parent process
+                    parent_pid, parent_name, parent_executable = get_parent_process(process)
+                    if parent_pid:
+                        log_data["parent_process"] = {
+                            "pid": parent_pid,
+                            "name": parent_name,
+                            "executable_path": parent_executable
+                        }
+
+                        # Check if the parent is the application generating the DNS request
+                        app_name, app_executable = get_application_from_pid(parent_pid)
+                        if app_name:
+                            log_data["parent_process"]["application"] = {
+                                "name": app_name,
+                                "executable_path": app_executable
+                            }
+                        else:
+                            log_data["parent_process"]["application"] = "Unknown"
+                else:
+                    log_data["process"]["svchost_involved"] = "No"
+            else:
+                log_data["process"]["svchost_involved"] = "No process identified"
+
+            # Write log data to JSON file
+            with open(LOG_FILE, "a") as log_file:
+                json.dump(log_data, log_file, indent=4)
+                log_file.write("\n")
+
+    except Exception as e:
+        print(f"Error processing packet: {e}")
+
+
+def main():
+    print("Starting DNS query monitoring (Press Ctrl+C to stop)...\n")
+    try:
+        sniff(filter="udp port 53", prn=dns_sniffer, store=False)
+    except KeyboardInterrupt:
+        print("\nStopping DNS monitoring... Goodbye!")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
